@@ -12,11 +12,6 @@ from app.route import router
 app = FastAPI(title="Portfolio Bot API")
 
 
-@app.get("/")
-def root() -> dict[str, str]:
-    return {"message": "Welcome to Portfolio Bot"}
-
-
 app.include_router(router)
 
 

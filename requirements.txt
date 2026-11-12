@@ -1,4 +1,10 @@
 fastapi
+langchain-core
+langchain-openai
 llama-index
+llama-index-embeddings-openai
+llama-index-vector-stores-pinecone
+pinecone
+python-dotenv
 pypdf
 uvicorn

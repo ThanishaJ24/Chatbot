@@ -7,11 +7,34 @@ from mimetypes import guess_type
 from pathlib import Path
 from typing import Any, Iterable
 
-from llama_index.core import Document, SimpleDirectoryReader
+from llama_index.core import Document
 from llama_index.core.node_parser import SentenceSplitter
+from pypdf import PdfReader
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
-SUPPORTED_EXTENSIONS = (".pdf", ".txt", ".md", ".docx")
+SUPPORTED_EXTENSIONS = (".pdf", ".txt", ".md")
+
+
+@dataclass(slots=True)
+class ParsedDocuments:
+    documents: list[Document]
+
+    def summary(self) -> dict[str, Any]:
+        file_names = sorted(
+            {
+                document.metadata.get("file_name", "unknown")
+                for document in self.documents
+            }
+        )
+        total_characters = sum(
+            int(document.metadata.get("character_count", 0))
+            for document in self.documents
+        )
+        return {
+            "document_count": len(self.documents),
+            "total_characters": total_characters,
+            "files": file_names,
+        }
 
 
 @dataclass(slots=True)
@@ -63,19 +86,19 @@ def load_documents(
     required_exts: Iterable[str] = SUPPORTED_EXTENSIONS,
     recursive: bool = False,
     num_files_limit: int | None = None,
+    file_offset: int = 0,
 ) -> list[Document]:
     input_dir = Path(data_dir)
     if not input_dir.exists():
         raise FileNotFoundError(f"Document directory does not exist: {input_dir}")
 
-    reader = SimpleDirectoryReader(
-        input_dir=str(input_dir),
-        recursive=recursive,
-        required_exts=list(required_exts),
-        num_files_limit=num_files_limit,
-        file_metadata=extract_file_metadata,
-    )
-    return reader.load_data()
+    allowed_exts = {extension.lower() for extension in required_exts}
+    paths = _iter_source_paths(input_dir, allowed_exts, recursive)
+    paths = paths[file_offset:]
+    if num_files_limit is not None:
+        paths = paths[:num_files_limit]
+
+    return [_load_document(path) for path in paths]
 
 
 def list_source_files(
@@ -88,12 +111,25 @@ def list_source_files(
         raise FileNotFoundError(f"Document directory does not exist: {input_dir}")
 
     allowed_exts = {extension.lower() for extension in required_exts}
-    files = input_dir.rglob("*") if recursive else input_dir.glob("*")
     return [
         extract_file_metadata(str(path))
-        for path in sorted(files)
-        if path.is_file() and path.suffix.lower() in allowed_exts
+        for path in _iter_source_paths(input_dir, allowed_exts, recursive)
     ]
+
+
+def parse_source_documents(
+    data_dir: Path | str = DEFAULT_DATA_DIR,
+    recursive: bool = False,
+    num_files_limit: int | None = None,
+    file_offset: int = 0,
+) -> ParsedDocuments:
+    documents = load_documents(
+        data_dir=data_dir,
+        recursive=recursive,
+        num_files_limit=num_files_limit,
+        file_offset=file_offset,
+    )
+    return ParsedDocuments(documents=documents)
 
 
 def parse_documents(
@@ -111,8 +147,12 @@ def parse_documents(
     for node in nodes:
         source_id = str(node.metadata.get("source_id", "unknown"))
         chunk_index = chunk_counts_by_source.get(source_id, 0)
+        content = node.get_content()
+        node.id_ = sha256(
+            f"{source_id}:{chunk_index}:{content}".encode("utf-8")
+        ).hexdigest()
         node.metadata["chunk_index"] = chunk_index
-        node.metadata["chunk_size"] = len(node.get_content())
+        node.metadata["chunk_size"] = len(content)
         chunk_counts_by_source[source_id] = chunk_index + 1
 
     return nodes
@@ -124,11 +164,13 @@ def process_documents(
     chunk_overlap: int = 128,
     recursive: bool = False,
     num_files_limit: int | None = None,
+    file_offset: int = 0,
 ) -> ProcessedDocuments:
     documents = load_documents(
         data_dir=data_dir,
         recursive=recursive,
         num_files_limit=num_files_limit,
+        file_offset=file_offset,
     )
     nodes = parse_documents(
         documents=documents,
@@ -148,5 +190,57 @@ def preview_nodes(nodes: list[Any], limit: int = 5) -> list[dict[str, Any]]:
     ]
 
 
+def preview_documents(
+    documents: list[Document],
+    limit: int = 5,
+    text_limit: int = 700,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "text": document.text[:text_limit],
+            "metadata": document.metadata,
+        }
+        for document in documents[:limit]
+    ]
+
+
 def _to_utc_iso(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, tz=UTC).isoformat()
+
+
+def _iter_source_paths(
+    input_dir: Path,
+    allowed_exts: set[str],
+    recursive: bool,
+) -> list[Path]:
+    files = input_dir.rglob("*") if recursive else input_dir.glob("*")
+    return sorted(
+        path
+        for path in files
+        if path.is_file() and path.suffix.lower() in allowed_exts
+    )
+
+
+def _load_document(path: Path) -> Document:
+    metadata = extract_file_metadata(str(path))
+
+    if path.suffix.lower() == ".pdf":
+        text, page_count = _read_pdf_text(path)
+        metadata["page_count"] = page_count
+    else:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+
+    metadata["character_count"] = len(text)
+    return Document(text=text, metadata=metadata)
+
+
+def _read_pdf_text(path: Path) -> tuple[str, int]:
+    reader = PdfReader(str(path))
+    pages = []
+
+    for page_number, page in enumerate(reader.pages, start=1):
+        page_text = page.extract_text() or ""
+        if page_text.strip():
+            pages.append(f"Page {page_number}\n{page_text}")
+
+    return "\n\n".join(pages), len(reader.pages)

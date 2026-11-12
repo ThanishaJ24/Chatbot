@@ -1,3 +1,6 @@
 /venv
 .env
 /data
+app/data/
+__pycache__/
+*.py[cod]
